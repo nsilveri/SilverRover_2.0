@@ -1,6 +1,8 @@
 import time
 import threading
 import logging
+import struct
+import json
 from collections import deque
 
 from smbus2 import SMBus
@@ -18,32 +20,29 @@ POWER_UNIT_ADDRESS = 0x49
 
 FIXED_ORDER = [
     MOTOR_UNIT_ADDRESS,
-    SOLAR_UNIT_ADDRESS,
-    POWER_UNIT_ADDRESS
+    SOLAR_UNIT_ADDRESS
 ]
 
 MQTT_BROKER = "localhost"
 MQTT_PORT   = 1883
 
-PRIORITY_MODE = True
-I2C_LOOP_DELAY = 0.03
+PRIORITY_MODE   = True
+I2C_LOOP_DELAY  = 0.03
+POWER_POLL_TIME = 0.5
 
 # =========================
-# TOPIC → (ADDR, MODE)
+# POWER REGISTERS
 # =========================
 
-STATEFUL_TOPICS = {
-    "rover/accel":               MOTOR_UNIT_ADDRESS,
-    "rover/steering_all":        MOTOR_UNIT_ADDRESS,
-    "rover/steering_each":       MOTOR_UNIT_ADDRESS,
-    "rover/steering_continuous": MOTOR_UNIT_ADDRESS,
-    "rover/camera":              SOLAR_UNIT_ADDRESS,
-    "rover/camera_continuous":   SOLAR_UNIT_ADDRESS,
-}
+POWER_REGS = [
+    ("INA226_1",     0x01),
+    ("INA226_2",     0x02),
+    ("INA3221_CH1",  0x03),
+    ("INA3221_CH2",  0x04),
+    ("INA3221_CH3",  0x05),
+]
 
-ONESHOT_TOPICS = {
-    "rover/panel": SOLAR_UNIT_ADDRESS
-}
+POWER_BASE_TOPIC = "rover/power"
 
 # =========================
 # LOGGING
@@ -55,7 +54,7 @@ logging.basicConfig(
 )
 
 # =========================
-# STATE
+# STATE (WRITE ONLY)
 # =========================
 
 state_lock = threading.Lock()
@@ -67,9 +66,6 @@ STATE = {
     SOLAR_UNIT_ADDRESS: {
         "stateful": {"packet": None, "reg": None},
         "oneshot":  {"packet": None, "reg": None, "dirty": False}
-    },
-    POWER_UNIT_ADDRESS: {
-        "stateful": {"packet": None, "reg": None}
     }
 }
 
@@ -78,7 +74,7 @@ STATE = {
 # =========================
 
 priority_queue = deque()
-priority_set = set()
+priority_set   = set()
 
 def enqueue_priority(addr):
     if addr not in priority_set:
@@ -107,47 +103,57 @@ def on_message(client, userdata, msg):
         topic = msg.topic
         payload_txt = msg.payload.decode().strip()
 
-        # -------------------------
-        # STATEFUL COMMANDS
-        # -------------------------
-        if topic in STATEFUL_TOPICS:
-            addr = STATEFUL_TOPICS[topic]
+        # ---------- MOTOR (0x45) ----------
+        if topic.startswith("rover/accel") or topic.startswith("rover/steering"):
             reg = int(payload_txt.split(",")[0])
             packet = build_packet(reg, payload_txt)
 
             with state_lock:
-                STATE[addr]["stateful"]["packet"] = packet
-                STATE[addr]["stateful"]["reg"] = reg
+                STATE[MOTOR_UNIT_ADDRESS]["stateful"].update({
+                    "packet": packet,
+                    "reg": reg
+                })
 
             if PRIORITY_MODE:
-                enqueue_priority(addr)
+                enqueue_priority(MOTOR_UNIT_ADDRESS)
 
-        # -------------------------
-        # ONE SHOT (PANELS)
-        # -------------------------
-        elif topic in ONESHOT_TOPICS:
-            addr = ONESHOT_TOPICS[topic]
+        # ---------- SOLAR CAMERA (stateful) ----------
+        elif topic in ("rover/camera", "rover/camera_continuous"):
             reg = int(payload_txt.split(",")[0])
             packet = build_packet(reg, payload_txt)
 
             with state_lock:
-                STATE[addr]["oneshot"].update({
+                STATE[SOLAR_UNIT_ADDRESS]["stateful"].update({
+                    "packet": packet,
+                    "reg": reg
+                })
+
+            if PRIORITY_MODE:
+                enqueue_priority(SOLAR_UNIT_ADDRESS)
+
+        # ---------- SOLAR PANEL (one-shot) ----------
+        elif topic == "rover/panel":
+            reg = int(payload_txt.split(",")[0])
+            packet = build_packet(reg, payload_txt)
+
+            with state_lock:
+                STATE[SOLAR_UNIT_ADDRESS]["oneshot"].update({
                     "packet": packet,
                     "reg": reg,
                     "dirty": True
                 })
 
             if PRIORITY_MODE:
-                enqueue_priority(addr)
+                enqueue_priority(SOLAR_UNIT_ADDRESS)
 
     except Exception as e:
         logging.error("MQTT error: %s", e)
 
 # =========================
-# I2C LOOP
+# I2C WRITE LOOP
 # =========================
 
-def i2c_loop():
+def i2c_write_loop():
     fixed_idx = 0
 
     while True:
@@ -164,7 +170,7 @@ def i2c_loop():
                 with state_lock:
                     unit = STATE[addr]
 
-                    # ---- ONE SHOT ----
+                    # --- ONE SHOT ---
                     if "oneshot" in unit:
                         o = unit["oneshot"]
                         if o["dirty"] and o["packet"]:
@@ -172,18 +178,53 @@ def i2c_loop():
                             logging.info("One-shot sent to 0x%02X", addr)
 
                             o["packet"] = None
-                            o["reg"] = None
-                            o["dirty"] = False
+                            o["reg"]    = None
+                            o["dirty"]  = False
 
-                    # ---- STATEFUL ----
+                    # --- STATEFUL ---
                     s = unit["stateful"]
                     if s["packet"]:
                         bus.write_i2c_block_data(addr, s["reg"], s["packet"][1:])
 
         except Exception as e:
-            logging.warning("I2C error 0x%02X: %s", addr, e)
+            logging.warning("I2C write error 0x%02X: %s", addr, e)
 
         time.sleep(I2C_LOOP_DELAY)
+
+# =========================
+# POWER READ LOOP (0x49)
+# =========================
+
+def power_read_loop(client):
+    last_values = {}
+
+    while True:
+        for name, reg in POWER_REGS:
+            try:
+                with SMBus(I2C_BUS) as bus:
+                    bus.write_i2c_block_data(POWER_UNIT_ADDRESS, 0, [reg])
+                    time.sleep(0.05)
+                    data = bus.read_i2c_block_data(POWER_UNIT_ADDRESS, 0, 9)
+
+                payload = bytes(data[1:9])
+                voltage, current = struct.unpack("<ff", payload)
+
+                voltage = round(voltage, 2)
+                current = round(current, 2)
+
+                if last_values.get(name) != (voltage, current):
+                    topic = f"{POWER_BASE_TOPIC}/{name}"
+                    msg = {
+                        "voltage": voltage,
+                        "current": current
+                    }
+                    client.publish(topic, json.dumps(msg))
+                    last_values[name] = (voltage, current)
+
+            except Exception as e:
+                logging.warning("Power read error %s: %s", name, e)
+
+        time.sleep(POWER_POLL_TIME)
 
 # =========================
 # MAIN
@@ -196,7 +237,8 @@ def main():
 
     mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 
-    threading.Thread(target=i2c_loop, daemon=True).start()
+    threading.Thread(target=i2c_write_loop, daemon=True).start()
+    threading.Thread(target=power_read_loop, args=(mqtt_client,), daemon=True).start()
 
     mqtt_client.loop_forever()
 
