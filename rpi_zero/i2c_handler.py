@@ -44,6 +44,10 @@ POWER_REGS = [
 
 POWER_BASE_TOPIC = "rover/power"
 
+# Relay commands (gestiti da POWER_UNIT)
+IR_RELAY_ON  = 0x07
+IR_RELAY_OFF = 0x08
+
 # =========================
 # LOGGING
 # =========================
@@ -66,6 +70,9 @@ STATE = {
     SOLAR_UNIT_ADDRESS: {
         "stateful": {"packet": None, "reg": None},
         "oneshot":  {"packet": None, "reg": None, "dirty": False}
+    },
+    POWER_UNIT_ADDRESS: {
+        "relay": {"state": None, "packet": None, "reg": None, "dirty": False}
     }
 }
 
@@ -103,7 +110,7 @@ def on_message(client, userdata, msg):
         topic = msg.topic
         payload_txt = msg.payload.decode().strip()
 
-        # ---------- MOTOR (0x45) ----------
+        # ---------- MOTOR ----------
         if topic.startswith("rover/accel") or topic.startswith("rover/steering"):
             reg = int(payload_txt.split(",")[0])
             packet = build_packet(reg, payload_txt)
@@ -146,6 +153,28 @@ def on_message(client, userdata, msg):
             if PRIORITY_MODE:
                 enqueue_priority(SOLAR_UNIT_ADDRESS)
 
+        # ---------- RELAY IR LED (POWER READ (0x49)) ----------
+        elif topic == "rover/relay_ir":
+            state = payload_txt.lower()
+            if state in ("on", "1", "true"):
+                reg = IR_RELAY_ON
+            elif state in ("off", "0", "false"):
+                reg = IR_RELAY_OFF
+            else:
+                logging.warning("Invalid relay state: %s", state)
+                return
+
+            with state_lock:
+                STATE[POWER_UNIT_ADDRESS]["relay"].update({
+                    "packet": [reg],
+                    "reg": 0,
+                    "dirty": True,
+                    "state": "on" if reg == IR_RELAY_ON else "off"
+                })
+
+            if PRIORITY_MODE:
+                enqueue_priority(POWER_UNIT_ADDRESS)
+
     except Exception as e:
         logging.error("MQTT error: %s", e)
 
@@ -185,6 +214,14 @@ def i2c_write_loop():
                     s = unit["stateful"]
                     if s["packet"]:
                         bus.write_i2c_block_data(addr, s["reg"], s["packet"][1:])
+
+                    # --- RELAY POWER_UNIT ---
+                    if addr == POWER_UNIT_ADDRESS:
+                        r = unit["relay"]
+                        if r["dirty"] and r["packet"]:
+                            bus.write_i2c_block_data(POWER_UNIT_ADDRESS, r["reg"], r["packet"])
+                            logging.info("Relay command sent: %s", r["state"])
+                            r["dirty"] = False
 
         except Exception as e:
             logging.warning("I2C write error 0x%02X: %s", addr, e)
